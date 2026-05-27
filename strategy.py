@@ -11,22 +11,29 @@ class OpeningRangeVWAPStrategy:
     def calculate_or_and_vwap(self, df: pd.DataFrame):
         df = df.rename(columns=str.lower).copy()
         
-        # 15-minute Opening Range
+        # Ensure we have required columns
+        required = ['open', 'high', 'low', 'close', 'volume']
+        if not all(col in df.columns for col in required):
+            print(f"❌ Missing columns. Have: {list(df.columns)}")
+            return
+
+        # 15-minute Opening Range (works even if run later in the day)
         or_df = df.between_time('09:30', '09:45')
-        if len(or_df) >= 3:
+        if len(or_df) >= 2:   # lowered threshold a bit
             self.or_high = float(or_df['high'].max())
             self.or_low = float(or_df['low'].min())
             print(f"✅ OR Set → High: {self.or_high:.2f} | Low: {self.or_low:.2f}")
         else:
-            print("⚠️ Not enough data for Opening Range")
+            print(f"⚠️ Only {len(or_df)} bars in OR window. Using available data.")
 
-        # Anchored VWAP from 09:30
-        vwap_df = df[df.index.time >= time(9, 30)]
-        if len(vwap_df) > 5:
+        # Anchored VWAP from market open
+        vwap_df = df[df.index.time >= pd.Timestamp('09:30').time()]
+        if len(vwap_df) > 3:
             tp = (vwap_df['high'] + vwap_df['low'] + vwap_df['close']) / 3
-            self.anchored_vwap = (tp * vwap_df['volume']).cumsum() / vwap_df['volume'].cumsum()
-            current_vwap = self.anchored_vwap.iloc[-1]
-            print(f"✅ Anchored VWAP: {current_vwap:.2f}")
+            volume = vwap_df['volume']
+            self.anchored_vwap = (tp * volume).cumsum() / volume.cumsum()
+            current_vwap = float(self.anchored_vwap.iloc[-1])
+            print(f"✅ Anchored VWAP: {current_vwap:.2f}  (based on {len(vwap_df)} bars)")
         else:
             print("⚠️ Not enough data for VWAP")
 

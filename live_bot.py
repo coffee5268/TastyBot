@@ -14,19 +14,34 @@ async def main():
     strategy = OpeningRangeVWAPStrategy()
     print("🚀 SPX 0 DTE Bot - Tastytrade Sandbox Version")
 
-    # Initial OR + VWAP calculation (using yfinance for history)
+    # Initial OR + VWAP calculation (using yfinance)
     print("📊 [STARTUP] Calculating today's OR + VWAP...")
     try:
         import yfinance as yf
-        df = yf.download("^GSPC", period="1d", interval="5m", progress=False)
-        if not df.empty:
+        df = yf.download(
+            "^GSPC", 
+            period="5d",          # More history in case today is short
+            interval="5m", 
+            progress=False,
+            prepost=False
+        )
+        
+        if df.empty:
+            print("❌ yfinance returned no data")
+        else:
+            # Handle MultiIndex columns (very common)
             if isinstance(df.columns, pd.MultiIndex):
-                df = df.droplevel(0, axis=1)
-            df = df.rename(columns=str.lower)
+                df = df.droplevel(0, axis=1)   # Remove ticker level
+            
+            df = df.rename(columns=str.lower).copy()
+            print(f"Downloaded {len(df)} bars. Columns: {list(df.columns)}")
+            
             strategy.calculate_or_and_vwap(df)
+            
     except Exception as e:
         print(f"Initial calc error: {e}")
-
+        import traceback
+        traceback.print_exc()
     # Live streaming with tastytrade
     async with DXLinkStreamer(session) as streamer:
         await streamer.subscribe(Quote, ['SPX'])   # or '^GSPC' / 'SPX' — test symbol
