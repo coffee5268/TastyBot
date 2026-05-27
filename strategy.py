@@ -9,33 +9,35 @@ class OpeningRangeVWAPStrategy:
         self.traded_today = False
 
     def calculate_or_and_vwap(self, df: pd.DataFrame):
-        df = df.rename(columns=str.lower).copy()
+        df = df.copy()
         
-        # Ensure we have required columns
+        # Final safety check
         required = ['open', 'high', 'low', 'close', 'volume']
-        if not all(col in df.columns for col in required):
-            print(f"❌ Missing columns. Have: {list(df.columns)}")
+        missing = [col for col in required if col not in df.columns]
+        if missing:
+            print(f"❌ Still missing columns: {missing}")
+            print(f"   Available: {list(df.columns)}")
             return
 
-        # 15-minute Opening Range (works even if run later in the day)
+        # 15-min Opening Range (works even if run later)
         or_df = df.between_time('09:30', '09:45')
-        if len(or_df) >= 2:   # lowered threshold a bit
+        if len(or_df) >= 2:
             self.or_high = float(or_df['high'].max())
             self.or_low = float(or_df['low'].min())
             print(f"✅ OR Set → High: {self.or_high:.2f} | Low: {self.or_low:.2f}")
         else:
-            print(f"⚠️ Only {len(or_df)} bars in OR window. Using available data.")
+            print(f"⚠️ Only {len(or_df)} bars found in 09:30-09:45 window")
 
-        # Anchored VWAP from market open
+        # Anchored VWAP from open
         vwap_df = df[df.index.time >= pd.Timestamp('09:30').time()]
         if len(vwap_df) > 3:
             tp = (vwap_df['high'] + vwap_df['low'] + vwap_df['close']) / 3
-            volume = vwap_df['volume']
-            self.anchored_vwap = (tp * volume).cumsum() / volume.cumsum()
+            self.anchored_vwap = (tp * vwap_df['volume']).cumsum() / vwap_df['volume'].cumsum()
             current_vwap = float(self.anchored_vwap.iloc[-1])
-            print(f"✅ Anchored VWAP: {current_vwap:.2f}  (based on {len(vwap_df)} bars)")
+            print(f"✅ Anchored VWAP: {current_vwap:.2f}  ({len(vwap_df)} bars)")
         else:
-            print("⚠️ Not enough data for VWAP")
+            print("⚠️ Not enough bars for VWAP")
+
 
     def get_signal(self, current_price: float) -> dict:
         if self.or_high is None or self.or_low is None or self.anchored_vwap is None or self.traded_today:

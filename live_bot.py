@@ -14,34 +14,32 @@ async def main():
     strategy = OpeningRangeVWAPStrategy()
     print("🚀 SPX 0 DTE Bot - Tastytrade Sandbox Version")
 
-    # Initial OR + VWAP calculation (using yfinance)
+    # Initial OR + VWAP calculation
     print("📊 [STARTUP] Calculating today's OR + VWAP...")
     try:
-        import yfinance as yf
-        df = yf.download(
-            "^GSPC", 
-            period="5d",          # More history in case today is short
-            interval="5m", 
-            progress=False,
-            prepost=False
-        )
+        df = yf.download("^GSPC", period="5d", interval="5m", progress=False)
         
-        if df.empty:
-            print("❌ yfinance returned no data")
-        else:
-            # Handle MultiIndex columns (very common)
-            if isinstance(df.columns, pd.MultiIndex):
-                df = df.droplevel(0, axis=1)   # Remove ticker level
-            
-            df = df.rename(columns=str.lower).copy()
-            print(f"Downloaded {len(df)} bars. Columns: {list(df.columns)}")
-            
-            strategy.calculate_or_and_vwap(df)
-            
+        print(f"   Raw shape: {df.shape}")
+        print(f"   Raw columns: {df.columns.tolist()}")
+        
+        # === ROBUST COLUMN CLEANING ===
+        if isinstance(df.columns, pd.MultiIndex):
+            df = df.droplevel(0, axis=1)          # Remove ticker level
+        
+        # Force standard column names (this fixes your current issue)
+        df.columns = ['Open', 'High', 'Low', 'Close', 'Adj Close', 'Volume']
+        df = df.rename(columns=str.lower)
+        
+        print(f"   After cleaning → Columns: {df.columns.tolist()}")
+        print(f"   Downloaded {len(df)} bars")
+        
+        strategy.calculate_or_and_vwap(df)
+        
     except Exception as e:
-        print(f"Initial calc error: {e}")
+        print(f"Initial calculation error: {e}")
         import traceback
         traceback.print_exc()
+
     # Live streaming with tastytrade
     async with DXLinkStreamer(session) as streamer:
         await streamer.subscribe(Quote, ['SPX'])   # or '^GSPC' / 'SPX' — test symbol
