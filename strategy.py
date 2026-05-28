@@ -3,7 +3,6 @@ from datetime import datetime, time, timedelta
 from collections import defaultdict
 from decimal import Decimal
 
-# Tastytrade imports
 from tastytrade.order import NewOrder, NewComplexOrder, OrderAction, OrderType, OrderTimeInForce
 from tastytrade.instruments import get_option_chain
 
@@ -13,23 +12,20 @@ class OpeningRangeVWAPStrategy:
         self.minute_bars = defaultdict(dict)
         self.or_high = None
         self.or_low = None
-        self.anchored_vwap = None  # Series for latest value
+        self.anchored_vwap = None
         self.traded_today = False
         self.today = None
         self.last_vwap_print = None
-        
+
         # Trade management
         self.trade_active = False
+        self.oco_placed = False
         self.entry_credit = None
         self.entry_order_id = None
-        self.position_symbol = None
         self.start_time = datetime.now()
         self.last_status_print = None
-        self.oco_placed = False
-
 
     def update_with_price(self, price: float, volume: float = 1000.0):
-        """Build 1-minute bars + calculate OR & VWAP"""
         now = datetime.now()
         today_str = now.date().isoformat()
 
@@ -39,9 +35,7 @@ class OpeningRangeVWAPStrategy:
         minute_key = now.replace(second=0, microsecond=0)
 
         if minute_key not in self.minute_bars:
-            self.minute_bars[minute_key] = {
-                'open': price, 'high': price, 'low': price, 'close': price, 'volume': volume
-            }
+            self.minute_bars[minute_key] = {'open': price, 'high': price, 'low': price, 'close': price, 'volume': volume}
         else:
             bar = self.minute_bars[minute_key]
             bar['high'] = max(bar['high'], price)
@@ -49,7 +43,7 @@ class OpeningRangeVWAPStrategy:
             bar['close'] = price
             bar['volume'] += volume
 
-        # 15-min Opening Range
+        # 15-min OR
         if self.or_high is None and now.time() >= time(9, 45):
             or_start = now.replace(hour=9, minute=30, second=0, microsecond=0)
             or_end = now.replace(hour=9, minute=45, second=0, microsecond=0)
@@ -80,12 +74,19 @@ class OpeningRangeVWAPStrategy:
         self.today = today_str
         self.last_vwap_print = None
 
+    def reset_trade_state(self):
+        """Reset so we can place another trade"""
+        print("🔄 Resetting trade state (new trade allowed)")
+        self.trade_active = False
+        self.oco_placed = False
+        self.entry_order_id = None
+        self.entry_credit = None
+
     def get_signal(self, current_price: float) -> dict:
         if self.or_high is None or self.or_low is None or self.anchored_vwap is None or self.traded_today:
             return {"action": "WAIT"}
 
-        print(f"DEBUG → Price: {current_price:.2f} | VWAP: {self.anchored_vwap:.2f} | "
-              f"OR H: {self.or_high:.2f} | OR L: {self.or_low:.2f}")
+        print(f"DEBUG → Price: {current_price:.2f} | VWAP: {self.anchored_vwap:.2f} | OR H: {self.or_high:.2f} | OR L: {self.or_low:.2f}")
 
         if current_price > self.or_high + 2:
             direction = 'up'
@@ -99,27 +100,34 @@ class OpeningRangeVWAPStrategy:
             return {"action": "SELL_PUT_SPREAD" if direction == 'up' else "SELL_CALL_SPREAD"}
         return {"action": "WAITING_FOR_RETEST"}
 
+    # ==================== ORDER PLACEMENT ====================
+
     async def place_put_credit_spread(self, session, account, current_price: float):
-        if self.trade_active or (datetime.now() - self.start_time).seconds < 60:
+        if self.trade_active:
+            print("   ⏭️ Trade already active")
             return None
 
-        print(f"\n🚀 [SANDBOX] Attempting Put Credit Spread near {current_price:.1f}")
+        print(f"\n🚀 [DEBUG] Attempting Put Credit Spread near {current_price:.1f}")
 
         try:
             for symbol in ["SPX", "/ES"]:
+                print(f"   Trying symbol: {symbol}")
                 chain = await get_option_chain(session, symbol)
                 today = datetime.now().date()
                 expirations = sorted([d for d in chain.keys() if d >= today])
-                if not expirations: continue
+                if not expirations:
+                    continue
                 exp_date = expirations[0]
 
                 puts = [opt for opt in chain[exp_date] if opt.option_type == 'P']
                 puts.sort(key=lambda x: x.strike_price)
 
-                target = Decimal(str(current_price - 20))
+                # Closer strike selection (better fill rate)
+                target = Decimal(str(current_price - 10))   # ~10 points OTM
                 short_opt = min(puts, key=lambda x: abs(x.strike_price - target))
                 lower_puts = [p for p in puts if p.strike_price < short_opt.strike_price]
-                if not lower_puts: continue
+                if not lower_puts:
+                    continue
                 long_opt = max(lower_puts, key=lambda x: x.strike_price)
 
                 width = float(short_opt.strike_price - long_opt.strike_price)
@@ -129,7 +137,7 @@ class OpeningRangeVWAPStrategy:
                 long_leg = long_opt.build_leg(1, OrderAction.BUY_TO_OPEN)
 
                 mid = (float(getattr(short_opt, 'last_price', 1.0)) + float(getattr(long_opt, 'last_price', 0.5))) / 2
-                credit = max(round(mid, 2), 0.40)
+                credit = max(round(mid, 2), 0.50)
 
                 order = NewOrder(
                     time_in_force=OrderTimeInForce.DAY,
@@ -139,15 +147,9 @@ class OpeningRangeVWAPStrategy:
                 )
 
                 response = await account.place_order(session, order, dry_run=False)
-                
-                # Better ID extraction
-                order_id = None
-                if hasattr(response, 'id'):
-                    order_id = response.id
-                elif hasattr(response, 'order') and hasattr(response.order, 'id'):
-                    order_id = response.order.id
+                order_id = getattr(response, 'id', None) or getattr(getattr(response, 'order', None), 'id', None)
 
-                print(f"✅ [LIVE SANDBOX] Order submitted | ID: {order_id} | Credit target ${credit}")
+                print(f"✅ [LIVE] Order submitted | ID: {order_id} | Credit: ${credit}")
 
                 self.trade_active = True
                 self.entry_credit = credit
@@ -163,93 +165,56 @@ class OpeningRangeVWAPStrategy:
             traceback.print_exc()
             return None
 
-
-    def print_trade_status(self):
-        now = datetime.now()
-        if self.last_status_print is None or (now - self.last_status_print).seconds >= 120:
-            seconds_left = max(0, 60 - (now - self.start_time).seconds)
-            status = "ACTIVE" if self.trade_active else f"PENDING ({seconds_left}s left)"
-            print(f"📊 [{now.strftime('%H:%M:%S')}] STATUS: {status} | Credit: {self.entry_credit}")
-            self.last_status_print = now
-
     async def check_for_fill_and_place_oco(self, session, account):
-        """Check if entry order filled and place OCO"""
         if not self.trade_active or self.oco_placed or not self.entry_order_id:
             return
 
         try:
-            orders = await account.get_live_orders(session)   # ← Correct method
+            orders = await account.get_live_orders(session)
             for order in orders:
                 if str(order.id) == str(self.entry_order_id):
+                    print(f"   Order {order.id} → Status: {order.status}")
+                    if hasattr(order, 'reject_reason') and order.reject_reason:
+                        print(f"   ❌ Reject Reason: {order.reject_reason}")
                     if order.status in ["Filled", "PartiallyFilled"]:
-                        print(f"🎉 ENTRY ORDER FILLED! ID: {order.id} | Status: {order.status}")
+                        print(f"🎉 ENTRY FILLED!")
                         await self.place_oco_orders(session, account)
                         self.oco_placed = True
                         return
-                    else:
-                        print(f"   Order status: {order.status} (waiting for fill)")
         except Exception as e:
             print(f"Fill check error: {e}")
 
     async def place_oco_orders(self, session, account):
-        """Robust OCO with better leg detection and conservative pricing"""
         if self.oco_placed:
             return
-
-        print(f"🛡️ Placing real OCO → TP ${self.entry_credit * 0.5:.2f} credit | SL ${self.entry_credit * 2.0:.2f} debit")
+        print(f"🛡️ Placing OCO → TP ${self.entry_credit * 0.4:.2f} | SL ${self.entry_credit * 2.0:.2f}")
 
         try:
             positions = await account.get_positions(session)
-            
-            short_pos = None
-            long_pos = None
-
-            print("   Current positions for OCO:")
-            for pos in positions:
-                qty = float(pos.quantity)
-                sym = getattr(pos, 'symbol', 'Unknown')
-                print(f"     {sym} | Qty: {qty}")
-                if qty < 0 and "P" in sym:          # Short leg
-                    short_pos = pos
-                elif qty > 0 and "P" in sym:        # Long leg
-                    long_pos = pos
+            short_pos = next((p for p in positions if float(p.quantity) < 0), None)
+            long_pos = next((p for p in positions if float(p.quantity) > 0), None)
 
             if not short_pos or not long_pos:
-                print("❌ Could not identify short + long legs")
+                print("❌ Could not find short/long legs")
                 return
 
-            print(f"   ✅ Using Short: {short_pos.symbol} | Long: {long_pos.symbol}")
-
-            # Build closing legs
             short_close = short_pos.instrument.build_leg(1, OrderAction.SELL_TO_CLOSE)
             long_close = long_pos.instrument.build_leg(1, OrderAction.BUY_TO_CLOSE)
 
-            # More conservative TP to avoid "would execute immediately"
-            tp_price = round(float(self.entry_credit) * 0.40, 2)   # 40% of credit
+            tp_price = round(float(self.entry_credit) * 0.40, 2)
             sl_price = round(float(self.entry_credit) * 2.0, 2)
-
-            print(f"   TP credit target: ${tp_price} | SL debit target: ${sl_price}")
 
             oco = NewComplexOrder(
                 orders=[
-                    NewOrder(
-                        time_in_force=OrderTimeInForce.GTC,
-                        order_type=OrderType.LIMIT,
-                        legs=[short_close, long_close],
-                        price=Decimal(str(-tp_price))
-                    ),
-                    NewOrder(
-                        time_in_force=OrderTimeInForce.GTC,
-                        order_type=OrderType.STOP,
-                        legs=[short_close, long_close],
-                        stop_trigger=Decimal(str(sl_price))
-                    )
+                    NewOrder(time_in_force=OrderTimeInForce.GTC, order_type=OrderType.LIMIT,
+                             legs=[short_close, long_close], price=Decimal(str(-tp_price))),
+                    NewOrder(time_in_force=OrderTimeInForce.GTC, order_type=OrderType.STOP,
+                             legs=[short_close, long_close], stop_trigger=Decimal(str(sl_price)))
                 ]
             )
 
-            response = await account.place_complex_order(session, oco, dry_run=False)
-            print(f"✅ OCO PLACED SUCCESSFULLY!")
-            print(f"   TP: ${tp_price} credit | SL: ${sl_price} debit")
+            await account.place_complex_order(session, oco, dry_run=False)
+            print(f"✅ OCO PLACED | TP ${tp_price} credit | SL ${sl_price} debit")
             self.oco_placed = True
 
         except Exception as e:
@@ -257,23 +222,17 @@ class OpeningRangeVWAPStrategy:
             import traceback
             traceback.print_exc()
 
-
     async def print_detailed_status(self, session, account, current_price: float):
         now = datetime.now()
         if self.last_status_print is None or (now - self.last_status_print).seconds >= 120:
             try:
                 positions = await account.get_positions(session)
                 print(f"\n📊 [{now.strftime('%H:%M:%S')}] LIVE STATUS | SPX {current_price:.2f}")
-
-                total_pnl = 0
                 for pos in positions:
                     pnl = getattr(pos, 'realized_day_gain', 0) or getattr(pos, 'net_liquidating_value', 0)
-                    total_pnl += float(pnl) if pnl else 0
-                    print(f"   📍 {pos.symbol} | Qty: {pos.quantity} | Est P&L: ${pnl}")
-
-                print(f"   💰 Total Est P&L: ${total_pnl:.2f}")
+                    print(f"   📍 {pos.symbol} | Qty: {pos.quantity} | P&L: ${pnl}")
                 if self.trade_active:
-                    print(f"   Bot Trade: ACTIVE | Entry Credit: ${self.entry_credit} | OCO: {'✅ Placed' if self.oco_placed else '⏳ Pending'}")
+                    print(f"   Bot Trade: ACTIVE | Credit: ${self.entry_credit} | OCO: {'✅' if self.oco_placed else '⏳'}")
             except Exception as e:
                 print(f"Status error: {e}")
             self.last_status_print = now
