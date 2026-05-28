@@ -80,7 +80,6 @@ class OpeningRangeVWAPStrategy:
         self.today = today_str
         self.last_vwap_print = None
 
->>>>>>> stream-only
     def get_signal(self, current_price: float) -> dict:
         if self.or_high is None or self.or_low is None or self.anchored_vwap is None or self.traded_today:
             return {"action": "WAIT"}
@@ -89,7 +88,6 @@ class OpeningRangeVWAPStrategy:
               f"OR H: {self.or_high:.2f} | OR L: {self.or_low:.2f}")
 
         if current_price > self.or_high + 2:
->>>>>>> stream-only
             direction = 'up'
         elif current_price < self.or_low - 2:
             direction = 'down'

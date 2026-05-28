@@ -4,7 +4,6 @@ from tasty_session import TastySession
 from strategy import OpeningRangeVWAPStrategy
 from tastytrade import DXLinkStreamer
 from tastytrade.dxfeed import Quote
->>>>>>> stream-only
 
 async def main():
     tasty = TastySession(is_test=True)
@@ -18,19 +17,16 @@ async def main():
     async with DXLinkStreamer(session) as streamer:
         await streamer.subscribe(Quote, ['SPX'])
         print("📡 Subscribed to live SPX quotes...")
->>>>>>> stream-only
 
         while True:
             try:
                 quote = await streamer.get_event(Quote)
->>>>>>> stream-only
                 price = getattr(quote, 'last_price', None)
                 if price is None:
                     price = (getattr(quote, 'bid_price', 0) + getattr(quote, 'ask_price', 0)) / 2
                 price = float(price)
 
                 # ... existing quote handling ...
->>>>>>> stream-only
 
                 strategy.update_with_price(price)
                 strategy.get_signal(price)
@@ -51,7 +47,6 @@ async def main():
                 await asyncio.sleep(2)
 
             await asyncio.sleep(0.5)
->>>>>>> stream-only
 
 if __name__ == "__main__":
     asyncio.run(main())
