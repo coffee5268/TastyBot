@@ -35,7 +35,9 @@ class OpeningRangeVWAPStrategy:
         minute_key = now.replace(second=0, microsecond=0)
 
         if minute_key not in self.minute_bars:
-            self.minute_bars[minute_key] = {'open': price, 'high': price, 'low': price, 'close': price, 'volume': volume}
+            self.minute_bars[minute_key] = {
+                'open': price, 'high': price, 'low': price, 'close': price, 'volume': volume
+            }
         else:
             bar = self.minute_bars[minute_key]
             bar['high'] = max(bar['high'], price)
@@ -43,7 +45,7 @@ class OpeningRangeVWAPStrategy:
             bar['close'] = price
             bar['volume'] += volume
 
-        # 15-min OR
+        # 15-min Opening Range
         if self.or_high is None and now.time() >= time(9, 45):
             or_start = now.replace(hour=9, minute=30, second=0, microsecond=0)
             or_end = now.replace(hour=9, minute=45, second=0, microsecond=0)
@@ -75,8 +77,7 @@ class OpeningRangeVWAPStrategy:
         self.last_vwap_print = None
 
     def reset_trade_state(self):
-        """Reset so we can place another trade"""
-        print("🔄 Resetting trade state (new trade allowed)")
+        print("🔄 Resetting trade state...")
         self.trade_active = False
         self.oco_placed = False
         self.entry_order_id = None
@@ -100,8 +101,6 @@ class OpeningRangeVWAPStrategy:
             return {"action": "SELL_PUT_SPREAD" if direction == 'up' else "SELL_CALL_SPREAD"}
         return {"action": "WAITING_FOR_RETEST"}
 
-    # ==================== ORDER PLACEMENT ====================
-
     async def place_put_credit_spread(self, session, account, current_price: float):
         if self.trade_active:
             print("   ⏭️ Trade already active")
@@ -111,27 +110,26 @@ class OpeningRangeVWAPStrategy:
 
         try:
             for symbol in ["SPX", "/ES"]:
-                print(f"   Trying symbol: {symbol}")
+                print(f"   Trying {symbol}...")
                 chain = await get_option_chain(session, symbol)
                 today = datetime.now().date()
-                expirations = sorted([d for d in chain.keys() if d >= today])
-                if not expirations:
+                expirations = sorted(d for d in chain.keys() if d >= today)
+                if not expirations: 
                     continue
                 exp_date = expirations[0]
 
                 puts = [opt for opt in chain[exp_date] if opt.option_type == 'P']
                 puts.sort(key=lambda x: x.strike_price)
 
-                # Closer strike selection (better fill rate)
-                target = Decimal(str(current_price - 10))   # ~10 points OTM
+                target = Decimal(str(current_price - 10))
                 short_opt = min(puts, key=lambda x: abs(x.strike_price - target))
                 lower_puts = [p for p in puts if p.strike_price < short_opt.strike_price]
-                if not lower_puts:
+                if not lower_puts: 
                     continue
                 long_opt = max(lower_puts, key=lambda x: x.strike_price)
 
                 width = float(short_opt.strike_price - long_opt.strike_price)
-                print(f"   ✅ Spread → Short {short_opt.strike_price} | Long {long_opt.strike_price} | Width ${width}")
+                print(f"   ✅ Spread: Short {short_opt.strike_price} → Long {long_opt.strike_price} (${width} wide)")
 
                 short_leg = short_opt.build_leg(1, OrderAction.SELL_TO_OPEN)
                 long_leg = long_opt.build_leg(1, OrderAction.BUY_TO_OPEN)
@@ -149,7 +147,7 @@ class OpeningRangeVWAPStrategy:
                 response = await account.place_order(session, order, dry_run=False)
                 order_id = getattr(response, 'id', None) or getattr(getattr(response, 'order', None), 'id', None)
 
-                print(f"✅ [LIVE] Order submitted | ID: {order_id} | Credit: ${credit}")
+                print(f"✅ Order submitted | ID: {order_id} | Credit ${credit}")
 
                 self.trade_active = True
                 self.entry_credit = credit
@@ -160,7 +158,7 @@ class OpeningRangeVWAPStrategy:
             return None
 
         except Exception as e:
-            print(f"❌ Order failed: {e}")
+            print(f"❌ Order error: {e}")
             import traceback
             traceback.print_exc()
             return None
