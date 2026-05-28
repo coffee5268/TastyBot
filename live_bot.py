@@ -26,24 +26,22 @@ async def main():
                     price = (getattr(quote, 'bid_price', 0) + getattr(quote, 'ask_price', 0)) / 2
                 price = float(price)
 
+                # ... existing quote handling ...
+
                 strategy.update_with_price(price)
                 strategy.get_signal(price)
 
-                # === TRADE TRIGGER DEBUG ===
-                elapsed = (datetime.now() - strategy.start_time).seconds
-                if not strategy.trade_active:
-                    print(f"⏱️  Elapsed: {elapsed}s | Trigger at 60s → {'READY' if elapsed >= 60 else 'WAITING'}")
+                # Trade placement
+                if not strategy.trade_active and (datetime.now() - strategy.start_time).seconds >= 60:
+                    await strategy.place_put_credit_spread(session, account, price)
 
-                    if elapsed >= 60:
-                        print("🔥 Triggering trade placement now...")
-                        success = await strategy.place_put_credit_spread(session, account, price)
-                        if success:
-                            print("✅ Trade placement attempted!")
-                        else:
-                            print("⚠️ Placement returned False")
+                # Check for fill + OCO
+                await strategy.check_for_fill_and_place_oco(session, account)
 
-                strategy.print_trade_status()
+                # Detailed status with P&L
+                await strategy.print_detailed_status(session, account, price)
 
+                strategy.print_trade_status()   # keep your old one if you want
             except Exception as e:
                 print(f"Loop error: {e}")
                 await asyncio.sleep(2)

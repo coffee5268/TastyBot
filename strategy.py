@@ -21,8 +21,12 @@ class OpeningRangeVWAPStrategy:
         # Trade management
         self.trade_active = False
         self.entry_credit = None
+        self.entry_order_id = None
+        self.position_symbol = None
         self.start_time = datetime.now()
         self.last_status_print = None
+        self.oco_placed = False
+
 
     def update_with_price(self, price: float, volume: float = 1000.0):
         """Build 1-minute bars + calculate OR & VWAP"""
@@ -96,53 +100,31 @@ class OpeningRangeVWAPStrategy:
         return {"action": "WAITING_FOR_RETEST"}
 
     async def place_put_credit_spread(self, session, account, current_price: float):
-        """Flexible spread: uses smallest available width (even if wide)"""
         if self.trade_active or (datetime.now() - self.start_time).seconds < 60:
-            return False
+            return None
 
         print(f"\n🚀 [SANDBOX] Attempting Put Credit Spread near {current_price:.1f}")
 
         try:
-            for symbol in ["SPX", "/ES"]:   # Try SPX then futures options
-                print(f"   Trying symbol: {symbol}")
+            for symbol in ["SPX", "/ES"]:
                 chain = await get_option_chain(session, symbol)
-                
                 today = datetime.now().date()
                 expirations = sorted([d for d in chain.keys() if d >= today])
-                if not expirations:
-                    continue
-                    
+                if not expirations: continue
                 exp_date = expirations[0]
+
                 puts = [opt for opt in chain[exp_date] if opt.option_type == 'P']
                 puts.sort(key=lambda x: x.strike_price)
 
-                print(f"   Found {len(puts)} put strikes for {symbol} exp {exp_date}")
-
-                # Debug: Show all strikes
-                print("   All available put strikes:")
-                for p in puts:
-                    print(f"     {p.strike_price}")
-
-                if len(puts) < 2:
-                    print(f"   Not enough strikes for {symbol}")
-                    continue
-
-                # Pick short strike ~20 points OTM
                 target = Decimal(str(current_price - 20))
                 short_opt = min(puts, key=lambda x: abs(x.strike_price - target))
-                print(f"   Selected Short Strike: {short_opt.strike_price}")
-
-                # Find the closest lower strike (any width)
                 lower_puts = [p for p in puts if p.strike_price < short_opt.strike_price]
-                if not lower_puts:
-                    print("   No lower strikes available")
-                    continue
+                if not lower_puts: continue
+                long_opt = max(lower_puts, key=lambda x: x.strike_price)
 
-                long_opt = max(lower_puts, key=lambda x: x.strike_price)  # closest below short
                 width = float(short_opt.strike_price - long_opt.strike_price)
-                print(f"   ✅ Found spread → Short {short_opt.strike_price} | Long {long_opt.strike_price} | Width: ${width}")
+                print(f"   ✅ Spread → Short {short_opt.strike_price} | Long {long_opt.strike_price} | Width ${width}")
 
-                # Build and place order
                 short_leg = short_opt.build_leg(1, OrderAction.SELL_TO_OPEN)
                 long_leg = long_opt.build_leg(1, OrderAction.BUY_TO_OPEN)
 
@@ -157,20 +139,30 @@ class OpeningRangeVWAPStrategy:
                 )
 
                 response = await account.place_order(session, order, dry_run=False)
-                print(f"✅ [DRY RUN] {width:.0f}-wide Put Credit Spread on {symbol} | Credit ≈ ${credit}")
+                
+                # Better ID extraction
+                order_id = None
+                if hasattr(response, 'id'):
+                    order_id = response.id
+                elif hasattr(response, 'order') and hasattr(response.order, 'id'):
+                    order_id = response.order.id
+
+                print(f"✅ [LIVE SANDBOX] Order submitted | ID: {order_id} | Credit target ${credit}")
 
                 self.trade_active = True
                 self.entry_credit = credit
-                return True
+                self.entry_order_id = order_id
+                return response
 
-            print("❌ Could not build any spread on SPX or /ES")
-            return False
+            print("❌ Could not build spread")
+            return None
 
         except Exception as e:
             print(f"❌ Order failed: {e}")
             import traceback
             traceback.print_exc()
-            return False
+            return None
+
 
     def print_trade_status(self):
         now = datetime.now()
@@ -178,4 +170,110 @@ class OpeningRangeVWAPStrategy:
             seconds_left = max(0, 60 - (now - self.start_time).seconds)
             status = "ACTIVE" if self.trade_active else f"PENDING ({seconds_left}s left)"
             print(f"📊 [{now.strftime('%H:%M:%S')}] STATUS: {status} | Credit: {self.entry_credit}")
+            self.last_status_print = now
+
+    async def check_for_fill_and_place_oco(self, session, account):
+        """Check if entry order filled and place OCO"""
+        if not self.trade_active or self.oco_placed or not self.entry_order_id:
+            return
+
+        try:
+            orders = await account.get_live_orders(session)   # ← Correct method
+            for order in orders:
+                if str(order.id) == str(self.entry_order_id):
+                    if order.status in ["Filled", "PartiallyFilled"]:
+                        print(f"🎉 ENTRY ORDER FILLED! ID: {order.id} | Status: {order.status}")
+                        await self.place_oco_orders(session, account)
+                        self.oco_placed = True
+                        return
+                    else:
+                        print(f"   Order status: {order.status} (waiting for fill)")
+        except Exception as e:
+            print(f"Fill check error: {e}")
+
+    async def place_oco_orders(self, session, account):
+        """Robust OCO with better leg detection and conservative pricing"""
+        if self.oco_placed:
+            return
+
+        print(f"🛡️ Placing real OCO → TP ${self.entry_credit * 0.5:.2f} credit | SL ${self.entry_credit * 2.0:.2f} debit")
+
+        try:
+            positions = await account.get_positions(session)
+            
+            short_pos = None
+            long_pos = None
+
+            print("   Current positions for OCO:")
+            for pos in positions:
+                qty = float(pos.quantity)
+                sym = getattr(pos, 'symbol', 'Unknown')
+                print(f"     {sym} | Qty: {qty}")
+                if qty < 0 and "P" in sym:          # Short leg
+                    short_pos = pos
+                elif qty > 0 and "P" in sym:        # Long leg
+                    long_pos = pos
+
+            if not short_pos or not long_pos:
+                print("❌ Could not identify short + long legs")
+                return
+
+            print(f"   ✅ Using Short: {short_pos.symbol} | Long: {long_pos.symbol}")
+
+            # Build closing legs
+            short_close = short_pos.instrument.build_leg(1, OrderAction.SELL_TO_CLOSE)
+            long_close = long_pos.instrument.build_leg(1, OrderAction.BUY_TO_CLOSE)
+
+            # More conservative TP to avoid "would execute immediately"
+            tp_price = round(float(self.entry_credit) * 0.40, 2)   # 40% of credit
+            sl_price = round(float(self.entry_credit) * 2.0, 2)
+
+            print(f"   TP credit target: ${tp_price} | SL debit target: ${sl_price}")
+
+            oco = NewComplexOrder(
+                orders=[
+                    NewOrder(
+                        time_in_force=OrderTimeInForce.GTC,
+                        order_type=OrderType.LIMIT,
+                        legs=[short_close, long_close],
+                        price=Decimal(str(-tp_price))
+                    ),
+                    NewOrder(
+                        time_in_force=OrderTimeInForce.GTC,
+                        order_type=OrderType.STOP,
+                        legs=[short_close, long_close],
+                        stop_trigger=Decimal(str(sl_price))
+                    )
+                ]
+            )
+
+            response = await account.place_complex_order(session, oco, dry_run=False)
+            print(f"✅ OCO PLACED SUCCESSFULLY!")
+            print(f"   TP: ${tp_price} credit | SL: ${sl_price} debit")
+            self.oco_placed = True
+
+        except Exception as e:
+            print(f"❌ OCO failed: {e}")
+            import traceback
+            traceback.print_exc()
+
+
+    async def print_detailed_status(self, session, account, current_price: float):
+        now = datetime.now()
+        if self.last_status_print is None or (now - self.last_status_print).seconds >= 120:
+            try:
+                positions = await account.get_positions(session)
+                print(f"\n📊 [{now.strftime('%H:%M:%S')}] LIVE STATUS | SPX {current_price:.2f}")
+
+                total_pnl = 0
+                for pos in positions:
+                    pnl = getattr(pos, 'realized_day_gain', 0) or getattr(pos, 'net_liquidating_value', 0)
+                    total_pnl += float(pnl) if pnl else 0
+                    print(f"   📍 {pos.symbol} | Qty: {pos.quantity} | Est P&L: ${pnl}")
+
+                print(f"   💰 Total Est P&L: ${total_pnl:.2f}")
+                if self.trade_active:
+                    print(f"   Bot Trade: ACTIVE | Entry Credit: ${self.entry_credit} | OCO: {'✅ Placed' if self.oco_placed else '⏳ Pending'}")
+            except Exception as e:
+                print(f"Status error: {e}")
             self.last_status_print = now
