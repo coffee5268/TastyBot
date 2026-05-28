@@ -1,61 +1,57 @@
 import asyncio
-import pandas as pd
 from datetime import datetime
 from tasty_session import TastySession
 from strategy import OpeningRangeVWAPStrategy
 from tastytrade import DXLinkStreamer
 from tastytrade.dxfeed import Quote
-from data_fetch import fetch_spx_bars_tasty  # new tasty fetch
+>>>>>>> stream-only
 
 async def main():
     tasty = TastySession(is_test=True)
     session = tasty.login()
     await tasty.load_accounts()
+    account = tasty.accounts[0]
 
     strategy = OpeningRangeVWAPStrategy()
-    print("🚀 SPX 0 DTE Bot - Tastytrade Sandbox")
+    print("🚀 SPX 0 DTE Bot - Tastytrade SANDBOX MODE (1-minute trade trigger)")
 
-    # Initial OR + VWAP using tastytrade data
-    print("📊 [STARTUP] Calculating today's OR + VWAP...")
-    try:
-        df = await fetch_spx_bars_tasty(session, days_back=2, interval='5m')
-        if not df.empty:
-            strategy.calculate_or_and_vwap(df)
-        else:
-            print("⚠️ Using placeholder OR/VWAP for testing live quotes...")
-            # Temporary placeholders so live loop runs
-            strategy.or_high = 5350.0
-            strategy.or_low = 5300.0
-            strategy.anchored_vwap = pd.Series([5325.0])
-    except Exception as e:
-        print(f"Initial data error: {e}")
-        # ... placeholders ...
-
-    # Live quotes
     async with DXLinkStreamer(session) as streamer:
-        await streamer.subscribe(Quote, ['SPX'])  # confirm symbol works in sandbox
+        await streamer.subscribe(Quote, ['SPX'])
+        print("📡 Subscribed to live SPX quotes...")
+>>>>>>> stream-only
 
         while True:
             try:
                 quote = await streamer.get_event(Quote)
-                # Mid or last price
+>>>>>>> stream-only
                 price = getattr(quote, 'last_price', None)
                 if price is None:
                     price = (getattr(quote, 'bid_price', 0) + getattr(quote, 'ask_price', 0)) / 2
                 price = float(price)
 
-                signal = strategy.get_signal(price)
+                # ... existing quote handling ...
+>>>>>>> stream-only
 
-                if signal['action'] in ["SELL_PUT_SPREAD", "SELL_CALL_SPREAD"]:
-                    print(f"🔥 SIGNAL! {signal['action']} at {price:.1f}")
-                    # TODO: place order via tasty API
+                strategy.update_with_price(price)
+                strategy.get_signal(price)
 
+                # Trade placement
+                if not strategy.trade_active and (datetime.now() - strategy.start_time).seconds >= 60:
+                    await strategy.place_put_credit_spread(session, account, price)
+
+                # Check for fill + OCO
+                await strategy.check_for_fill_and_place_oco(session, account)
+
+                # Detailed status with P&L
+                await strategy.print_detailed_status(session, account, price)
+
+                strategy.print_trade_status()   # keep your old one if you want
             except Exception as e:
-                print(f"Quote error: {e}")
-                await asyncio.sleep(5)
-                continue
+                print(f"Loop error: {e}")
+                await asyncio.sleep(2)
 
-            await asyncio.sleep(1)  # faster polling if needed
+            await asyncio.sleep(0.5)
+>>>>>>> stream-only
 
 if __name__ == "__main__":
     asyncio.run(main())
